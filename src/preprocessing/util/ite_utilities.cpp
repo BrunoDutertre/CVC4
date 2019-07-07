@@ -294,7 +294,7 @@ ITECompressor::ITECompressor(ContainsTermITEVisitor* contains)
 //    : d_contains(contains), d_assertions(NULL), d_incoming(true, true)
   : d_assertions(NULL), d_incoming(true, true)
 {
-  Assert(d_contains != NULL);
+  //  Assert(d_contains != NULL);
 
   d_true = NodeManager::currentNM()->mkConst<bool>(true);
   d_false = NodeManager::currentNM()->mkConst<bool>(false);
@@ -547,7 +547,7 @@ bool ITECompressor::compress(std::vector<Node>& assertions)
     Node compressed = compressBoolean(assertion);
     Node rewritten = theory::Rewriter::rewrite(compressed);
     assertions[i] = rewritten;
-    Assert(!d_contains->containsTermITE(rewritten));
+    //    Assert(!d_contains->containsTermITE(rewritten));
 
     nofalses = (rewritten != d_false);
   }
