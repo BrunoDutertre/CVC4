@@ -48,8 +48,8 @@ TheoryProxy::TheoryProxy(PropEngine* propEngine,
       d_decisionEngine(decisionEngine),
       d_theoryEngine(theoryEngine),
       d_channels(channels),
-      d_replayLog(replayLog),
-      d_replayStream(replayStream),
+      //      d_replayLog(replayLog), // BD: REMOVED SINCE NOT USED
+      //      d_replayStream(replayStream), // BD: REMOVED SINCE NOT USED
       d_queue(context),
       d_replayedDecisions("prop::theoryproxy::replayedDecisions", 0)
 {

@@ -121,10 +121,12 @@ public:
   LemmaChannels* d_channels;
 
   /** Stream on which to log replay events. */
-  std::ostream* d_replayLog;
+  // BD: this is not used and causes compilation warnings
+  //  std::ostream* d_replayLog;
 
   /** Stream for replaying decisions. */
-  ExprStream* d_replayStream;
+  // BD: this is not used and causes compilation warnings
+  //  ExprStream* d_replayStream;
 
   /** The lemma input channel we are using. */
   LemmaInputChannel* inputChannel();

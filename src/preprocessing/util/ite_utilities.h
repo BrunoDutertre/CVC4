@@ -175,7 +175,7 @@ class ITECompressor
  private:
   Node d_true;  /* Copy of true. */
   Node d_false; /* Copy of false. */
-  ContainsTermITEVisitor* d_contains;
+  //  ContainsTermITEVisitor* d_contains; // BD: NOT USED
   std::vector<Node>* d_assertions;
   IncomingArcCounter d_incoming;
 

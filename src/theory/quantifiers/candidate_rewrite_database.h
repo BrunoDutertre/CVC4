@@ -128,13 +128,18 @@ class CandidateRewriteDatabaseGen
 
  private:
   /** reference to quantifier engine */
-  QuantifiersEngine* d_qe;
+  // BD: this is not used
+  //  QuantifiersEngine* d_qe;
+
   /** the variables */
   std::vector<Node> d_vars;
   /** sygus sampler object for each type */
   std::map<TypeNode, SygusSampler> d_sampler;
+
   /** the number of samples */
-  unsigned d_nsamples;
+  // BD: this is not used
+  //  unsigned d_nsamples;
+
   /** candidate rewrite databases for each type */
   std::map<TypeNode, CandidateRewriteDatabase> d_cdbs;
   /** an extended rewriter object */

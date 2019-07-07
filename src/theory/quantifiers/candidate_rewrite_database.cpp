@@ -295,7 +295,9 @@ void CandidateRewriteDatabase::setExtendedRewriter(ExtendedRewriter* er)
 
 CandidateRewriteDatabaseGen::CandidateRewriteDatabaseGen(
     std::vector<Node>& vars, unsigned nsamples)
-    : d_qe(nullptr), d_vars(vars.begin(), vars.end()), d_nsamples(nsamples)
+  // BD: removed the unused stuff to avoid compile-time warnings
+  //    : d_qe(nullptr), d_vars(vars.begin(), vars.end()), d_nsamples(nsamples)
+  :  d_vars(vars.begin(), vars.end())
 {
 }
 

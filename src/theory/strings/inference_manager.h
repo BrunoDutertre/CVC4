@@ -226,7 +226,9 @@ class InferenceManager
    *
    * This is a reference to the equality engine of the theory of strings.
    */
-  eq::EqualityEngine& d_ee;
+  // BD: THIS IS NOT USED
+  //  eq::EqualityEngine& d_ee;
+
   /** the output channel
    *
    * This is a reference to the output channel of the theory of strings.

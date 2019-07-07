@@ -1,6 +1,7 @@
 #!/bin/bash
 #
 source "$(dirname "$0")/get-script-header.sh"
+CURRENT_DIR=`pwd`
 ANTLR_HOME_DIR=antlr-3.4
 
 if [ -z "${BUILD_TYPE}" ]; then
@@ -46,7 +47,8 @@ cd libantlr3c-3.4
 
 # Use an absolute path for the installation directory to avoid spurious libtool
 # warnings about the ANTLR library having moved
-PREFIX=$(realpath `pwd`/../..)
+# PREFIX=$(realpath `pwd`/../..)
+PREFIX=$CURRENT_DIR/$ANTLR_HOME_DIR
 
 # Make antlr3debughandlers.c empty to avoid unreferenced symbols
 rm -rf src/antlr3debughandlers.c && touch src/antlr3debughandlers.c

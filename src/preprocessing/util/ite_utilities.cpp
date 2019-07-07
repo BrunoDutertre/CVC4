@@ -291,7 +291,8 @@ void IncomingArcCounter::clear() { d_reachCount.clear(); }
 /* ITECompressor
  */
 ITECompressor::ITECompressor(ContainsTermITEVisitor* contains)
-    : d_contains(contains), d_assertions(NULL), d_incoming(true, true)
+//    : d_contains(contains), d_assertions(NULL), d_incoming(true, true)
+  : d_assertions(NULL), d_incoming(true, true)
 {
   Assert(d_contains != NULL);
 

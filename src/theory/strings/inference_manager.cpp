@@ -34,7 +34,8 @@ InferenceManager::InferenceManager(TheoryStrings& p,
                                    context::UserContext* u,
                                    eq::EqualityEngine& ee,
                                    OutputChannel& out)
-    : d_parent(p), d_ee(ee), d_out(out), d_keep(c)
+//    : d_parent(p), d_ee(ee), d_out(out), d_keep(c) // BD: d_ee is not used
+  : d_parent(p),  d_out(out), d_keep(c)
 {
   d_true = NodeManager::currentNM()->mkConst(true);
   d_false = NodeManager::currentNM()->mkConst(false);

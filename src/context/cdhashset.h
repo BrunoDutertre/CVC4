@@ -50,8 +50,12 @@ public:
     this->ContextObj::deleteSelf();
   }
 
+  // BD: AlwaysAssert may throw an exception but delete is
+  // marked noexcept (since C++11)
   static void operator delete(void* pMem) {
-    AlwaysAssert(false, "It is not allowed to delete a ContextObj this way!");
+    fputs("It is not allowed to delete a ContextObj this way!", stderr);
+    abort();
+    //    AlwaysAssert(false, "It is not allowed to delete a ContextObj this way!");
   }
 
   CDHashSet(Context* context) :
