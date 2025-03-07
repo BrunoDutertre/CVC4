@@ -47,7 +47,7 @@
            ($str_to_flat_form s rev)
            ($str_to_flat_form t rev))
       (((@pair ss ts)
-        (= 
+        (=
           ($str_from_flat_form ss rev)
           ($str_from_flat_form ts rev)))))
 )
@@ -60,7 +60,7 @@
 ; args:
 ; - rev Bool: Whether we are reasoning about the end of strings s and t.
 ; requires: leq refers to children that are prefixes (resp. suffixes) of s and t.
-; conclusion: an equality between the given children of s and t. 
+; conclusion: an equality between the given children of s and t.
 (declare-rule concat_unify ((U Type) (s U) (t U) (s1 U) (t1 U) (rev Bool))
   :premises ((= s t) (= (str.len s1) (str.len t1)))
   :args (rev)
@@ -120,8 +120,8 @@
             (((str.++ s1 s2)
               (eo::requires s1 sc
                 (eo::define ((k (@purify ($str_unify_split t1 s1 rev))))
-                (and 
-                  (or 
+                (and
+                  (or
                     (= t1
                       (eo::ite rev
                         (str.++ k s1)
@@ -317,7 +317,7 @@
 ; - m1: The first membership
 ; - m2: The second membership, for the same string.
 ; conclusion: >
-;   The string is in the intersection of the regular expressions referred to in 
+;   The string is in the intersection of the regular expressions referred to in
 ;   the premises.
 (declare-rule re_inter ((x String) (s RegLan) (t RegLan))
   :premises ((str.in_re x s) (str.in_re x t))
@@ -342,8 +342,8 @@
             (eo::match ((k1 String) (k2 String) (k3 String) (M Bool :list))
             ($re_unfold_pos_concat t (re.++ r1 r r1))
             (((@pair (str.++ k1 k2 k3) M)
-                (or 
-                (= t "") 
+                (or
+                (= t "")
                 (str.in_re t r1)
                 (and
                     (eo::cons and (= t (str.++ k1 k2 k3)) M)
@@ -425,13 +425,13 @@
 (declare-rule string_ext ((T Type)  (s (Seq T)) (t (Seq T)))
   :premises ((not (= s t)))
   :conclusion (eo::define ((k (@strings_deq_diff s t)))
-              (or (not (= (str.len s) (str.len t))) 
+              (or (not (= (str.len s) (str.len t)))
                   (and (not (= ($str_mk_nth s k) ($str_mk_nth t k)))
                        (<= 0 k)
                        (< k (str.len s)))))
 )
 
-;;-------------------- Extended functions 
+;;-------------------- Extended functions
 
 ; rule: string_reduction
 ; implements: ProofRule::STRING_REDUCTION
@@ -491,7 +491,7 @@
 ; conclusion: The given equality.
 (declare-rule str-in-re-eval ((s String) (r RegLan) (b Bool))
   :args ((= (str.in_re s r) b))
-  :requires ((($str_eval_str_in_re s r) b))
+  :requires ((($str_eval_str_in_re_brzo s r) b))  ;;;  AWS Update
   :conclusion (= (str.in_re s r) b)
 )
 
@@ -507,7 +507,7 @@
 ; conclusion: The given equality.
 (declare-rule str-in-re-consume ((s String) (r RegLan) (b Bool))
   :args ((= (str.in_re s r) b))
-  :requires ((($str_re_consume s r) b))
+  :requires ((($str_re_consume_brzo s r) b))      ;;; AWS Update
   :conclusion (= (str.in_re s r) b)
 )
 
@@ -551,7 +551,7 @@
 ; conclusion: The given equality.
 (declare-rule str-in-re-concat-star-char ((s1 String) (s2 String :list) (r RegLan) (b Bool))
   :args ((= (str.in_re (str.++ s1 s2) (re.* r)) b))
-  :requires ((($str_fixed_len_re r) 1) 
+  :requires ((($str_fixed_len_re r) 1)
              (($str_mk_str_in_re_concat_star_char (str.++ s1 s2) (re.* r)) b))
   :conclusion (= (str.in_re (str.++ s1 s2) (re.* r)) b)
 )
@@ -583,3 +583,24 @@
   :requires ((($str_mk_str_in_re_sigma_star s r) b))
   :conclusion (= (str.in_re s (re.* r)) b)
 )
+
+;;; AWS Updates: Brzozowski-based variant of the str_in_re_eval rule
+;;;
+;;; Copyright 2024-2025, Amazon Web Services and others. All rights reserved.
+
+; rule: str-in-re-eval-brzo
+; Checks whether a string is in regex using Brzozowski derivatives
+(declare-rule str-in-re-eval-brzo ((s String) (r RegLan) (b Bool))
+  :args ((= (str.in_re s r) b))
+  :requires ((($str_eval_str_in_re_brzo s r) b))
+  :conclusion (= (str.in_re s r) b)
+)
+
+;; str_in_re_consume rule's Brzozowski based variant
+(declare-rule str-in-re-consume-brzo ((s String) (r RegLan) (b Bool))
+  :args ((= (str.in_re s r) b))
+  :requires ((($str_re_consume_brzo s r) b))
+  :conclusion (= (str.in_re s r) b)
+)
+
+;;; End AWS Updates

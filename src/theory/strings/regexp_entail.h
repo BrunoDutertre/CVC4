@@ -13,6 +13,12 @@
  * Entailment tests involving regular expressions.
  */
 
+/*
+ * Entailment tests based on Brzozowski derivatives:
+ *
+ * Copyright 2024-2025, Amazon Web Services and others. All rights reserved.
+ */
+
 #include "cvc5_private.h"
 
 #ifndef CVC5__THEORY__STRINGS__REGEXP_ENTAIL_H
@@ -36,6 +42,28 @@ class RegExpEntail
 {
  public:
   RegExpEntail(Rewriter* r);
+
+  /**** AWS Updates: Variant entailment checks using Brzozowski derivatives ****/
+
+  /** Check if the empty string (epsilon) is in the Regexp */
+  static Node check_epsilon_in_re(Node& regex);
+
+  // A cache to store the result of taking derivative w.r.t one character of a regular expression.
+  static std::map<std::tuple<Node, Node, bool>, Node> brzo_consume_one_cache;
+  static std::map<Node, Node> flattened_regex_cache;
+
+  /**
+   * Computing one step of Brzozowski derivative given a string and regular expression
+   * mchildren is the string that represents the str.++ of its children.
+   **/
+  static Node brzo_consume_one(const Node& str, const Node& regex, const bool reverse);
+  static Node deeply_flatten_strings_in_regex (const Node& regex);
+  static Node brzo_consume_string(std::vector<Node>& str_vec, const Node& regex, const bool reverse, Node& smallest_result_found);
+  static Node brzo_consume_left_right(const Node& str, const Node& regex, bool return_smallest);
+  static bool brzo_eval_str_in_re(const Node& str, const Node& regex);
+
+  /**** end of AWS updates ****/
+
   /** simple regular expression consume
    *
    * This method is called when we are rewriting a membership of the form

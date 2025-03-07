@@ -21,6 +21,7 @@
 #include "theory/strings/word.h"
 #include "util/rational.h"
 #include "util/string.h"
+#include "util/regexp.h"
 
 using namespace std;
 using namespace cvc5::internal::kind;
@@ -34,6 +35,826 @@ RegExpEntail::RegExpEntail(Rewriter* r) : d_aent(r)
   d_zero = NodeManager::currentNM()->mkConstInt(Rational(0));
   d_one = NodeManager::currentNM()->mkConstInt(Rational(1));
 }
+
+/**** AWS update: Brzozowski derivatives ****/
+
+/** Initialize the cache */
+std::map<std::tuple<Node, Node, bool>, Node> RegExpEntail::brzo_consume_one_cache;
+std::map<Node, Node> RegExpEntail::flattened_regex_cache;
+
+/**
+ * Returns Node::null() if we cannot decide the test, otherwise Node(true) or Node(false).
+ */
+Node RegExpEntail::check_epsilon_in_re(Node& regex) {
+  Trace("regexp-brzo-rewrite-debug") << "Checking if epsilon is in RE: " << regex << std::endl;
+  NodeManager* nm = NodeManager::currentNM();
+  Node d_emptyWord = Word::mkEmptyWord(nm->stringType());
+  switch(regex.getKind()) {
+    case Kind::REGEXP_NONE: return nm->mkConst(false); break;
+    // case Kind::REGEXP_ALL: return nm->mkConst(true);
+    case Kind::REGEXP_ALLCHAR: return nm->mkConst(false); break;
+    case Kind::STRING_TO_REGEXP: {
+      // check if the string is constant
+      Node re_str = regex[0];
+      if (re_str.isConst()) {
+        return nm->mkConst(Word::isEmpty(re_str));
+      }
+      return Node::null();
+      break;
+    }
+    case Kind::REGEXP_INTER:
+    case Kind::REGEXP_CONCAT: {
+      Trace("regexp-brzo-rewrite-debug") << "Case matched - REGEXP_CONCAT or INTER " << std::endl;
+      std::vector<Node> childrenc;
+      for (auto c : regex) {
+        Trace("regexp-brzo-rewrite-debug") << "Checking Child " << c << std::endl;
+        Trace("regexp-brzo-rewrite-debug") << push;
+        Node ret = check_epsilon_in_re(c);
+        Trace("regexp-brzo-rewrite-debug") << pop;
+        Trace("regexp-brzo-rewrite-debug") << "Result of checking child " << c << " is " << ret << std::endl;
+
+        if (ret == Node::null() || ret == nm->mkConst(false)) {
+          return ret;
+        }
+        if (ret == nm->mkConst(true)) {
+          continue;
+        }
+        else {
+          Trace("regexp-brzo-rewrite-debug") << "\tResult of epsilon_in_re_check must be null, true or false node." << std::endl;
+          Unreachable();
+        }
+      }
+      return nm->mkConst(true);
+      break;
+    }
+    case Kind::REGEXP_UNION: {
+      // Result might be unknown. If we encountered an unknown result, and we did not get  `true` for any element, then we return Node::null().
+      bool encountered_unknown = false;
+      for (auto c : regex) {
+        Node ret = check_epsilon_in_re(c);
+        if (ret == Node::null()) {
+          encountered_unknown = true;
+        }
+        if (ret == nm->mkConst(true)) {
+          return nm->mkConst(true);
+        }
+      }
+      if (encountered_unknown) {
+        return Node::null();
+      }
+      return nm->mkConst(false);
+      break;
+    }
+    case Kind::REGEXP_STAR: return nm->mkConst(true); break;
+    case Kind::REGEXP_PLUS: {
+      Node reg_inside = regex[0];
+      return check_epsilon_in_re(reg_inside);
+      break;
+    }
+    case Kind::REGEXP_OPT:  return nm->mkConst(true); break;
+    case Kind::REGEXP_RANGE: {
+      // a range can never contain epsilon
+      return nm->mkConst(false);
+      break;
+    }
+    case Kind::REGEXP_LOOP: {
+      // HS Caution: Not clear about the structure of the regexp_loop node.
+      // Still sound.
+      uint32_t lo = utils::getLoopMinOccurrences(regex);
+      if (lo == 0) { return nm->mkConst(true); }
+      else {
+        Node reg_inside = regex[0];
+        return check_epsilon_in_re(reg_inside);
+      }
+      break;
+    }
+    case Kind::REGEXP_COMPLEMENT: {
+      Node reg_inside = regex[0];
+      Node res = check_epsilon_in_re(reg_inside);
+      if (res == nm->mkConst(true)) { return nm->mkConst(false); }
+      if (res == nm->mkConst(false)) { return nm->mkConst(true); }
+      return Node::null();
+      break;
+    }
+    default:
+      return Node::null();
+      break;
+  }
+}
+
+/**
+ * Deeply flattens the strings. Removes the empty string from str.++
+ */
+std::vector<Node> string_flatten_deep(const Node& str) {
+  NodeManager* nm = NodeManager::currentNM();
+  Node d_emptyWord = Word::mkEmptyWord(nm->stringType());
+  std::vector<Node> children;
+  if (str.getKind() == Kind::STRING_CONCAT) {
+    for (auto c: str) {
+      auto c_flat = string_flatten_deep(c);
+      for (auto cc: c_flat) {
+        if (cc == d_emptyWord) continue; // filter out empty strings and drop them
+        children.push_back(cc);
+      }
+    }
+
+    return children;
+  }
+  // Otherwise just return the string node inside a vector
+  return {str};
+}
+
+/**
+ * Deeply flattens the strings. Removes the empty string from str.++. Also, expands words "abc" to "a" ++ "b" ++ "c"
+ */
+std::vector<Node> string_flatten_deep_true(const Node& str) {
+  NodeManager* nm = NodeManager::currentNM();
+  Node d_emptyWord = Word::mkEmptyWord(nm->stringType());
+  std::vector<Node> children;
+  if (str.getKind() == Kind::STRING_CONCAT) {
+    for (auto c: str) {
+      auto c_flat = string_flatten_deep_true(c);
+      for (auto cc: c_flat) {
+        if (cc == d_emptyWord) continue; // filter out empty strings and drop them
+        children.push_back(cc);
+      }
+    }
+    return children;
+  }
+  else if (str.isConst()) {
+    return Word::getChars(str);
+  }
+  // Otherwise just return the string node inside a vector
+  return {str};
+}
+
+// We also remove all the redundant empty strings from inside the str.to_re
+
+Node RegExpEntail::deeply_flatten_strings_in_regex (const Node& regex) {
+  Trace("regexp-brzo-rewrite-debug") << "Flattening the regex " << regex << std::endl;
+  // check cache
+  if (flattened_regex_cache.find(regex) != flattened_regex_cache.end()) {
+    return flattened_regex_cache[regex];
+  }
+  Node result;
+  NodeManager* nm = NodeManager::currentNM();
+  switch (regex.getKind()) {
+    case Kind::STRING_TO_REGEXP: {
+      Node re_str = regex[0];
+      auto str_vec = string_flatten_deep(re_str);
+      Node flat_str = utils::mkConcat(str_vec, nm->stringType());
+      result = nm->mkNode(Kind::STRING_TO_REGEXP, flat_str);
+      break;
+    }
+    case Kind::REGEXP_CONCAT:
+    case Kind::REGEXP_PLUS:
+    case Kind::REGEXP_OPT:
+    case Kind::REGEXP_STAR:
+    case Kind::REGEXP_COMPLEMENT:
+    case Kind::REGEXP_INTER:
+    case Kind::REGEXP_UNION: {
+        std::vector<Node> children;
+        for (auto c: regex) {
+          Node c_flat = deeply_flatten_strings_in_regex(c);
+          children.push_back(c_flat);
+        }
+        result =  nm->mkNode(regex.getKind(), children);
+        break;
+    }
+    case Kind::REGEXP_LOOP: {
+      Node lop = regex.getOperator();
+      Node reg_inside = regex[0];
+      Node ret_c = deeply_flatten_strings_in_regex(reg_inside);
+      result =  nm->mkNode(Kind::REGEXP_LOOP, lop, ret_c);
+      break;
+    }
+    default: {
+        if (regex.getMetaKind() == MetaKind::CONSTANT) {
+          return regex;
+          break;
+        }
+        // Trace("regexp-brzo-rewrite-debug") << "In default case for deeply_flatten_strings_in_regex() for regex " << regex << std::endl;
+        return regex;
+    }
+  }
+  // cache the result
+  flattened_regex_cache[regex] = result;
+  return result;
+}
+
+
+// Removes chr from str from back if reverse is true, and from front if reverse is false
+// requirement: `chr` must be constant string of length 1, or a variable, skolem, or STRING_REV kind
+//               `str` must not have any "" unless it is itself "", and it must be deeply flattened. So, there should
+//                not be any STRING_CONCAT inside the first level child.
+// returns: Null if trimming failed due to presence of variable/skolem etc. For example, for str = "ab"  , chr = var_X, we would return Node::null()
+// returns remaining string if prefix/suffix is found. For example, for str = "abc" , chr = "a", we would return "bc"
+// returns d_emptyLanguage if prefix/suffix is not there. For example, for str = "a" , chr = "b", we would return d_emptyLanguage
+Node trimChrFromDirection(const Node& str, const Node& chr, const bool reverse) {
+  NodeManager* nm = NodeManager::currentNM();
+  Node d_emptyWord = Word::mkEmptyWord(nm->stringType());
+  Node d_emptyLanguage = nm->mkNode(Kind::REGEXP_NONE);
+  Trace("regexp-brzo-rewrite-debug") << "Trimming a unit-length string (prefix/suffix) " << chr << " from " << str << " in direction (0 is left to right) " << reverse << std::endl;
+  Assert((chr.isConst() && Word::getLength(chr) == 1) || (chr.getKind() == Kind::SKOLEM || chr.getKind() == Kind::VARIABLE || chr.getKind() == Kind::STRING_REV));
+  if (chr.isConst() && Word::isEmpty(chr)) {
+    return str;
+  }
+  else if (str == chr) {
+    return d_emptyWord;
+  }
+  else if (str.isConst() && chr.isConst()) {
+      Node ret;
+      if (!reverse) {
+        ret = Word::hasPrefix(str, chr)
+                ? Word::substr(str, 1, Word::getLength(str)-1)
+                : d_emptyLanguage;
+      }
+      else {
+        ret = Word::hasSuffix(str, chr)
+                ? Word::substr(str, 0, Word::getLength(str)-1)
+                : d_emptyLanguage;
+      }
+      return ret;
+  }
+  else if (str.getKind() == Kind::STRING_CONCAT) {
+    Node child_to_check = reverse? str[str.getNumChildren()-1] : str[0];
+    Node res = trimChrFromDirection(child_to_check, chr, reverse);
+    if (res == Node::null()) return Node::null(); // If the last step failed, then we fail.
+    std::vector<Node> children;
+    if (reverse) {
+      // Note that we do not add the last child in this loop
+      for (auto i = 0; i < str.getNumChildren()-1; i++) {
+        children.push_back(str[i]);
+      }
+      if (res != d_emptyWord) children.push_back(res);
+    }
+    else {
+      // We add the result as first child if it is not empty string
+      if (res != d_emptyWord) children.push_back(res);
+      for (auto i = 1; i < str.getNumChildren(); i++) {
+        children.push_back(str[i]);
+      }
+    }
+    return utils::mkConcat(children, nm->stringType());
+  }
+  return Node::null();
+}
+
+Node mkConcatRegex(std::vector<Node> children) {
+    NodeManager* nm = NodeManager::currentNM();
+    std::vector<Node> children_ret;
+    for (auto c: children) {
+      if (c.getKind() == Kind::REGEXP_NONE) {
+        // If one of the regex in concatentation/intersection is \emptyset then whole concat is \emptyset
+        // so, we can decide that the result has to be re.none
+        return  nm->mkNode(Kind::REGEXP_NONE, {});
+      }
+      // We flatten all the concat children except those that are of the form (r1.r2*)
+      if (c.getKind() == Kind::REGEXP_CONCAT && !(c.getNumChildren() == 2 && c[1].getKind() == Kind::REGEXP_STAR)) {
+        for (auto cc: c) {
+          children_ret.push_back(cc);
+        }
+      }
+      else if (c.getKind() == Kind::STRING_TO_REGEXP && c[0].isConst() && Word::isEmpty(c[0])) {
+        // ignore str.to_re "" in concatenations
+        continue;
+      }
+      else {
+        children_ret.push_back(c);
+      }
+    }
+    return utils::mkConcat(children_ret, nm->regExpType());
+}
+
+Node mkUnionRegex(std::vector<Node> children) {
+  NodeManager* nm = NodeManager::currentNM();
+  std::set<Node> children_set;
+  std::vector<Node> children_no_duplicates;
+  for (auto c: children) {
+    if (c.getKind() == Kind::REGEXP_UNION) {
+      // append to children_set
+      for (auto cc: c) {
+        if (cc.getKind() == Kind::REGEXP_NONE) continue;
+        if (children_set.count(cc)>0) {
+            continue;
+        }
+        else {
+          children_set.insert(cc);
+          children_no_duplicates.push_back(cc);
+        }
+      }
+    }
+    else if (c.getKind() == Kind::REGEXP_NONE) {
+      // ignore empty language in a union
+      continue;
+    }
+    else if (children_set.count(c)>0) {
+            continue;
+    }
+    else {
+      children_set.insert(c);
+      children_no_duplicates.push_back(c);
+    }
+  }
+
+
+  if (children_no_duplicates.size() == 0) {
+    return nm->mkNode(Kind::REGEXP_NONE, {});
+  }
+  else if (children_no_duplicates.size() == 1) {
+    return children_no_duplicates[0];
+  }
+  else {
+    return nm->mkNode(Kind::REGEXP_UNION, children_no_duplicates);
+  }
+}
+
+/**
+ * We compute chr^{-1}regex.
+ * Node chr represents one character or variable. Assume it is not STRING_CONCAT.
+ * We return Node::null() when we fail to compute the derivative completely.
+ */
+Node RegExpEntail::brzo_consume_one(const Node& chr,
+                      const Node& regex, const bool reverse)
+{
+  Trace("regexp-brzo-rewrite-debug") << "Brzo-consume on character " << chr << " of kind " << chr.getKind() << " and regex " << regex << " in direction (0 is left to right) " << reverse << std::endl;
+  if (Word::isEmpty(chr)) {
+    return regex;
+  }
+  if (!((chr.isConst() && Word::getLength(chr) == 1) || (chr.getKind() == Kind::SKOLEM || chr.getKind() == Kind::VARIABLE || chr.getKind() == Kind::STRING_REV))) {
+    Trace("regexp-brzo-rewrite-debug") << "Brzo-consume on character " << chr << " of kind " << chr.getKind() << " and regex " << regex << " failed as chr is not of right kind/length" << std::endl;
+    return Node::null();
+  }
+
+  // Check cache RegExpEntail::brzo_consume_one_cache
+  auto cache_key = std::make_tuple(chr, regex, reverse);
+  auto cache_val = RegExpEntail::brzo_consume_one_cache.find(cache_key);
+  if (cache_val != RegExpEntail::brzo_consume_one_cache.end()) {
+    Trace("regexp-brzo-rewrite-debug") << "Brzo-consume on character " << chr << " and regex " << regex << " found in cache" << std::endl;
+    return cache_val->second;
+  }
+
+  NodeManager* nm = NodeManager::currentNM();
+  Node d_emptyWord = Word::mkEmptyWord(nm->stringType());
+  Node d_emptyWordRegex = nm->mkNode(Kind::STRING_TO_REGEXP, d_emptyWord);
+  Node d_emptyLanguage = nm->mkNode(Kind::REGEXP_NONE, std::vector<Node>{});
+  Node ret;
+  switch (regex.getKind()) {
+    case Kind::REGEXP_NONE:
+      ret = nm->mkNode(Kind::REGEXP_NONE, std::vector<Node>{});
+      break;
+    case Kind::REGEXP_ALL: {
+      // HS: Assuming REGEXP_ALL is equivalent to Sigma^*.
+      // HS Note: (This is not a bug) If the given regex was syntactically (Sigma)^*, then we would go to REGEXP_STAR
+      // case and taking derivative will fail for Kind::VARIABLE strings. But here, it succeeds.
+      ret = regex;
+      break;
+    }
+    case Kind::REGEXP_ALLCHAR:
+      ret = chr.isConst() ? d_emptyWordRegex : Node::null();
+      break;
+    case Kind::STRING_TO_REGEXP: {
+      Node re_str = regex[0];
+      Trace("regexp-brzo-rewrite-debug") << push;
+      Node result_re_str = trimChrFromDirection(re_str, chr, reverse);
+      Trace("regexp-brzo-rewrite-debug") << pop;
+      Trace("regexp-brzo-rewrite-debug") << "Result from trimming " << chr << " from " << re_str << " is " << result_re_str << std::endl;
+      if (result_re_str == Node::null()) {
+        // save the result in cache
+        RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+        return Node::null(); // check failed due to either non-const regex or non-const chr, or both
+      }
+      if (result_re_str == d_emptyLanguage) {
+        ret = d_emptyLanguage;
+      }
+      else {
+        ret = nm->mkNode(Kind::STRING_TO_REGEXP, result_re_str);
+      }
+      break;
+    }
+    case Kind::REGEXP_INTER: {
+      // If one of the derivative gave us re.none, then we know that the whole things is re.none even if we failed to compute the derivative for other children
+      bool encountered_null = false;
+      bool encountered_re_none = false;
+      vector<Node> children_ret;
+      for (auto c: regex) {
+        Trace("regexp-brzo-rewrite-debug") << push;
+        Node ret_c = brzo_consume_one(chr, c, reverse);
+        Trace("regexp-brzo-rewrite-debug") << pop;
+        if (ret_c == d_emptyLanguage) {
+          encountered_re_none = true;
+          break;
+        }
+        if (ret_c == Node::null()) {
+          encountered_null = true;
+          // Note that encountered_null tells us that we could not compute deriviate
+          // for some child of re.inter, however, we must continue to test because we might encounter_re_none later which might
+          // make the whole expression equivalent to re.none. If we don't find re.none, then we fail in computing the derivative.
+          continue;
+        }
+        children_ret.push_back(ret_c);
+      }
+      if (!encountered_re_none && encountered_null) {
+        // if one of the derivative failed and none of the derivative gave us re.none, then we fail
+        RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+        return Node::null();
+      }
+      else if (encountered_re_none) {
+        ret = d_emptyLanguage;
+      }
+      else {
+        // If we did not encounter re.none, and the derivative of all children was successfully computed
+        ret = nm->mkNode(Kind::REGEXP_INTER, children_ret);
+      }
+      break;
+    }
+    case Kind::REGEXP_CONCAT: {
+      // Get all the childrens in a vector
+      std::vector<Node> children_vec;
+      utils::getConcat(regex, children_vec);
+      if (reverse) std::reverse(children_vec.begin(), children_vec.end()); // reverse the children_vec
+
+      // Detect if we are in R1 ++ R2* case when reverse = false (or equivalently, R2* ++ R1 when reverse = true)
+      // In this case, we get (a^{-1}R_1 \cup v(R_1)a^{-1}R_2) R_2*, where v(R_1) = epsilon \in r_1
+      if (children_vec.size() == 2 && children_vec[1].getKind() == Kind::REGEXP_STAR) {
+        vector<Node> children_ret;
+        Node R1 = children_vec[0];
+        Node R2 = children_vec[1][0];
+        Node eps_in_r1 = check_epsilon_in_re(R1);
+        if (eps_in_r1 == Node::null()) {
+          // cache
+          RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+          return Node::null();
+        }
+        Trace("regexp-brzo-rewrite-debug") << "Epsilon in R1 is " << eps_in_r1 << std::endl;
+        Trace("regexp-brzo-rewrite-debug") << push;
+        Node derivative_R1 = brzo_consume_one(chr, R1, reverse);
+        Trace("regexp-brzo-rewrite-debug") << pop;
+        if (derivative_R1 == Node::null()) {
+          // cache
+          RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+          return Node::null();
+        }
+        children_ret.push_back(derivative_R1);
+        if (eps_in_r1 == nm->mkConst(true)) {
+          Trace("regexp-brzo-rewrite-debug") << push;
+          Node derivative_R2 = brzo_consume_one(chr, R2, reverse);
+          Trace("regexp-brzo-rewrite-debug") << pop;
+          if (derivative_R2 == Node::null()) {
+            // cache
+            RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+            return Node::null();
+          }
+          children_ret.push_back(derivative_R2);
+        }
+        Assert(children_ret.size() > 0);
+        Node reg_union;
+        if (children_ret.size() == 1) {
+          reg_union = children_ret[0];
+        }
+        else {
+          reg_union = mkUnionRegex(children_ret); // create the union
+        }
+        std::vector<Node> children_for_concat = {reg_union, children_vec[1]};
+        // We have to again reverse the concatenation's children here if reverse is true
+        if (reverse) std::reverse(children_for_concat.begin(), children_for_concat.end());
+        ret = mkConcatRegex(children_for_concat); // concatenate R2* at the end.
+        RegExpEntail::brzo_consume_one_cache[cache_key] = ret;
+      }
+      else {
+        // If it a not a concatenation of the form R1 ++ R2* if reverse = true
+        /**
+         * We do following to compute c^{-1}(R1R2R3)
+         * 0. Let U = {}
+         * 1. Compute dR1 = c^{-1}R_1.
+         * 2. if dR1 is successfully computed, then we add (dR1).R2R3 to the vector U.
+         * 3. if R1 does not contain epsilon, then we just return the re.union U.
+         * 4. If R1 does contain epsilon, then we also need to compute c^{-1}(R2R3).
+         * 4.1. We compute dR2 = c^{-1}R2. If dR2 is successfully computed, then we add (dR2).R3 to the vector U.
+         * 4.2. We check if R2 contains epsilon. If it does not, we return re.union U.
+         * 4.3. If R2 contains epsilon, then we also need to compute c^{-1}(R3). If dR3 is successfully computed, then we add (dR3) to the vector U.
+         * 5. We return the re.union U = (a^-1R1)R2R3 \cup (a^{-1}R2)R3 \cup (a^{-1}R3)
+         */
+        vector<Node> children_ret_union;
+        vector<vector<Node>> concat_children_of_union;
+        uint32_t ind = 0;
+        for (ind = 0; ind < children_vec.size(); ind++) {
+          // The regex we are processing at this iteration is: R_{ind}R_{ind+1}R_{ind+2}...R_{regex.getNumChildren()-1}
+          Node c = children_vec[ind];
+          // Optimization is this: when we have a long concat: R1.R2.R3.R4.R5, suppose R2 does not contain "" but R1 does, then we
+          // get the following optimized result (a^{-1}R1R2 \cup a^{-1}R2)R3R4R5
+          for (auto& children: concat_children_of_union) {
+            children.push_back(c);
+          }
+          Trace("regexp-brzo-rewrite-debug") << push;
+          Node ret_c = brzo_consume_one(chr, c, reverse);
+          Trace("regexp-brzo-rewrite-debug") << pop;
+          if (ret_c == Node::null()) {
+            // cache
+            RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+            return Node::null();
+          }
+          concat_children_of_union.push_back({ret_c});
+          auto has_epsilon = check_epsilon_in_re(c);
+          Trace("regexp-brzo-rewrite-debug") << "Epsilon in c is " << has_epsilon << std::endl;
+          if (has_epsilon == Node::null()) {
+            // cache
+            RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+            return Node::null(); // if we cannot decide has_epsilon, then we fail
+          }
+          if (has_epsilon == nm->mkConst(false)) break; else continue;
+        }
+        // make concat of each vector inside concat_children_of_union and make a union of the top
+        vector<Node> new_childrens;
+        for (auto& c: concat_children_of_union) {
+          // reverse all children
+          if (reverse) std::reverse(c.begin(), c.end());
+          new_childrens.push_back(mkConcatRegex(c));
+        }
+        Node final_left_union = mkUnionRegex(new_childrens);
+        // make a concat of all the children remaining from ind+1 onward
+        vector<Node> final_concat_vec;
+        final_concat_vec.push_back(final_left_union);
+        for (int i = ind+1; i < children_vec.size(); i++) {
+            final_concat_vec.push_back(children_vec[i]);
+        }
+        // Finally, reverse the final_concat_vec if reverse is true
+        if (reverse) std::reverse(final_concat_vec.begin(), final_concat_vec.end());
+        Node opt_result = mkConcatRegex(final_concat_vec);
+        Trace("regexp-brzo-rewrite-debug") << "Optimized result is " << opt_result << std::endl;
+        ret = opt_result;
+        RegExpEntail::brzo_consume_one_cache[cache_key] = ret;
+      }
+      break;
+    }
+    case Kind::REGEXP_UNION: {
+      // Even if we cannot compute the derivative for all the children of the union, we might infer that some of
+      // the children have derivative equal to re.none, and we can at least simplify the regular expression
+      // that we need to check the membership for. We DON'T attempt to do this here to keep things clean.
+
+      // For example, a \in (re.union regexA (str.to_re "b")) is equivalent to a \in regexA.
+      // We are not handling this kind of simplifications here.
+      vector<Node> children_ret;
+      for (auto c: regex) {
+        Trace("regexp-brzo-rewrite-debug") << push;
+        Node ret_c = brzo_consume_one(chr, c, reverse);
+        Trace("regexp-brzo-rewrite-debug") << pop;
+        if (ret_c == Node::null()) {
+          // cache
+          RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+          return Node::null();
+        }
+        children_ret.push_back(ret_c);
+      }
+      ret = mkUnionRegex(children_ret);
+      RegExpEntail::brzo_consume_one_cache[cache_key] = ret;
+      break;
+    }
+    case Kind::REGEXP_STAR: {
+      Node reg_inside = regex[0];
+      Trace("regexp-brzo-rewrite-debug") << push;
+      Node derivative_reg_inside = brzo_consume_one(chr, reg_inside, reverse);
+      Trace("regexp-brzo-rewrite-debug") << pop;
+      if (derivative_reg_inside == Node::null()) {
+        // cache
+        RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+        return Node::null();
+      }
+      std::vector<Node> children_concat = {derivative_reg_inside, regex};
+      if (reverse) std::reverse(children_concat.begin(), children_concat.end());
+      ret = mkConcatRegex(children_concat);
+      RegExpEntail::brzo_consume_one_cache[cache_key] = ret;
+      break;
+    }
+    case Kind::REGEXP_PLUS: {
+      // R+ \equiv R ++ R*
+      Node reg_star = nm->mkNode(Kind::REGEXP_STAR, regex[0]);
+      Node equiv_regex = mkConcatRegex({regex[0], reg_star});
+      Trace("regexp-brzo-rewrite-debug") << push;
+      ret = brzo_consume_one(chr, equiv_regex, reverse);
+      Trace("regexp-brzo-rewrite-debug") << pop;
+      break;
+    }
+    case Kind::REGEXP_OPT: {
+      // As chr cannot be empty string, for us, R? is behaves same as R.
+      Node reg_inside = regex[0];
+      ret = brzo_consume_one(chr, reg_inside, reverse);
+      break;
+    }
+    case Kind::REGEXP_RANGE: {
+      if (!regex[0].isConst() || !regex[1].isConst() || !chr.isConst()) {
+        // we cannot handle ranges if either of the bounds are not constant, or the given character/string is not a constant
+        return Node::null();
+      }
+
+      String a = regex[0].getConst<String>();
+      String b = regex[1].getConst<String>();
+      String c = chr.getConst<String>();
+      ret = (a <= c && c <= b) ? d_emptyWordRegex : d_emptyLanguage;;
+      break;
+    }
+    case Kind::REGEXP_LOOP: {
+      // HS Caution: Not clear about the structure of the regexp_loop node
+      uint32_t l = utils::getLoopMinOccurrences(regex);
+      uint32_t u = utils::getLoopMaxOccurrences(regex);
+      if (l > u || (l == u && l == 0)) {
+        // cache
+        RegExpEntail::brzo_consume_one_cache[cache_key] = d_emptyLanguage;
+        return d_emptyLanguage;
+      }
+      Node reg_inside = regex[0];
+      Trace("regexp-brzo-rewrite-debug") << "The regex inside the regex loop " << regex << " is " << reg_inside << std::endl;
+      Node derivative_reg_inside = brzo_consume_one(chr, reg_inside, reverse);
+      if (derivative_reg_inside == Node::null()) {
+        // cache
+        RegExpEntail::brzo_consume_one_cache[cache_key] = Node::null();
+        return Node::null();
+      }
+      Node lop = nm->mkConst(RegExpLoop(l == 0 ? 0 : (l - 1), u - 1));
+      Node r2 = nm->mkNode(Kind::REGEXP_LOOP, lop, regex[0]);
+      std::vector<Node> children_concat = {derivative_reg_inside, r2};
+      if (reverse) std::reverse(children_concat.begin(), children_concat.end());
+      ret = mkConcatRegex(children_concat);
+      break;
+    }
+    case Kind::REGEXP_COMPLEMENT: {
+      Node reg_inside = regex[0];
+      Node derivative_reg_inside = brzo_consume_one(chr, reg_inside, reverse);
+      if (derivative_reg_inside == Node::null()) return Node::null();
+      ret = nm->mkNode(Kind::REGEXP_COMPLEMENT, std::vector<Node>{derivative_reg_inside});
+      break;
+    }
+    default:
+      {
+        return Node::null();
+      }
+      break;
+  }
+  Trace("regexp-brzo-rewrite-debug") << "Brzo-consume-one's result is " << ret << std::endl;
+  return ret;
+}
+
+static int sizeofnode(const Node& regex) {
+  int s = 0;
+  for (const Node& c : regex) {
+    s += sizeofnode(c);
+  }
+  s += 1;
+  return s;
+}
+
+
+// Assumes that str_vec is vector of strings none of which is STRING_CONCAT type.
+// @requirement call this with str_vec that was from deeply_flattened_strings and
+// regex that has been modified with deeply_flatten_strings_in_regex.
+// Modifies the str_vec in-place according to how much it was consumed
+// If smallest_result_found == Node::null(), then the computation for the smallest result is not done
+Node RegExpEntail::brzo_consume_string(std::vector<Node>& str_vec, const Node& regex, const bool reverse, Node& smallest_result_found) {
+  // We want to pop characters from the str_vec, so we reverse the str_vec
+  // if reverse is false!
+  if (!reverse) std::reverse(str_vec.begin(), str_vec.end());
+  // We also want to keep track of the smallest_regex + remaining string that we see in this function
+  NodeManager* nm = NodeManager::currentNM();
+  Node d_emptyLanguage = nm->mkNode(Kind::REGEXP_NONE);
+  Node smallest_regex = regex;
+  Node prev_result = regex;
+  Node curr_result = regex;
+  while (curr_result != Node::null() && str_vec.size() > 0) {
+    if (curr_result == d_emptyLanguage) {
+      str_vec.clear();                 // We should clear the str_vec as everything will be consumed by re.none and final result will still be re.none
+      return d_emptyLanguage;
+    }
+    Node chr = str_vec.back();
+    Trace("regexp-brzo-rewrite-debug") << "Processing character in brzo_consume_string" << chr << std::endl;
+    Trace("regexp-brzo-rewrite-debug") << "Current result is " << curr_result << std::endl;
+    if (chr.getKind() == Kind::CONST_STRING) {
+        str_vec.pop_back();
+        // We expand the chr
+        auto vec_chars = Word::getChars(chr);
+        if (!reverse) std::reverse(vec_chars.begin(), vec_chars.end());
+        while (vec_chars.size() > 0) {
+          Node letter = vec_chars.back();
+          Trace("regexp-brzo-rewrite-debug") << "Processing letter in brzo_consume_string" << letter << std::endl;
+          curr_result = brzo_consume_one(letter, curr_result, reverse);
+          if (curr_result == Node::null()) break;
+          else {
+            vec_chars.pop_back();
+            // To store the smallest result
+            if (smallest_result_found != Node::null() && sizeofnode(curr_result)  <= sizeofnode(smallest_regex)) {
+                Trace("regexp-brzo-rewrite-debug") << "Changing smallest regex from " << smallest_regex << " to " << curr_result << std::endl;
+                smallest_regex = curr_result;
+                // create a copy of str_vec
+                std::vector<Node> str_vec_cpy(str_vec);
+                if (vec_chars.size() != 0) {
+                  // reverse str_vec_cpy for the reconstruction of the word temporarily
+                  if (!reverse) std::reverse(vec_chars.begin(), vec_chars.end());
+                  auto current_state_of_word = Word::mkWordFlatten(vec_chars);
+                  if (!reverse) std::reverse(vec_chars.begin(), vec_chars.end());
+                  str_vec_cpy.push_back(current_state_of_word);
+                }
+                // reverse str_vec_cpy
+                if (!reverse) std::reverse(str_vec_cpy.begin(), str_vec_cpy.end());
+                auto current_state_of_string = utils::mkConcat(str_vec_cpy, nm->stringType());
+                smallest_result_found = nm->mkNode(Kind::STRING_IN_REGEXP, current_state_of_string, curr_result);
+            }
+            prev_result = curr_result;
+          }
+        }
+        if (vec_chars.size() == 0) {}
+        else {
+          // We have **not** consumed all the characters in chr, so we create the remaining word back
+          if (!reverse) std::reverse(vec_chars.begin(), vec_chars.end());
+          Node rem_chr = Word::mkWordFlatten(vec_chars);
+          str_vec.push_back(rem_chr);
+          break;
+        }
+    }
+    else {
+      curr_result = brzo_consume_one(chr, curr_result, reverse);
+      if (curr_result == Node::null()) break;
+      else {
+        prev_result = curr_result;
+        str_vec.pop_back();
+        if (smallest_result_found != Node::null() && sizeofnode(curr_result)  <= sizeofnode(smallest_regex) ) {
+           Trace("regexp-brzo-rewrite-debug") << "Changing smallest regex from " << smallest_regex << " to " << curr_result << std::endl;
+            smallest_regex = curr_result;
+            // We have already popped the last element of str_vec.
+            if (!reverse) std::reverse(str_vec.begin(), str_vec.end());
+            // reverse str temporarily to create concat
+            auto current_state_of_string = utils::mkConcat(str_vec, nm->stringType());
+            if (!reverse) std::reverse(str_vec.begin(), str_vec.end());
+            smallest_result_found = nm->mkNode(Kind::STRING_IN_REGEXP, current_state_of_string, curr_result);
+        }
+      }
+    }
+  }
+  if (!reverse) std::reverse(str_vec.begin(), str_vec.end());
+  Trace("regexp-brzo-rewrite-debug") << "Smallest result I found was " << smallest_result_found << std::endl;
+  return prev_result;
+}
+
+Node RegExpEntail::brzo_consume_left_right(const Node& str, const Node& regex, bool return_smallest = false) {
+  Trace("regexp-brzo-rewrite-debug") << "\n*****************\nBrzo_consume_left_right on string " << str << " and regex " << regex << std::endl;
+  Trace("regexp-brzo-rewrite-debug")  << push;
+  NodeManager* nm = NodeManager::currentNM();
+  auto str_vec = string_flatten_deep(str);
+  Node _regex = deeply_flatten_strings_in_regex(regex);
+  // Consume from left
+  Node smallest_result_inside = Node::null();
+  if (return_smallest)  smallest_result_inside = nm->mkNode(Kind::STRING_IN_REGEXP, str, regex); // initially it is the full problem
+  Node result = brzo_consume_string(str_vec, _regex, false, smallest_result_inside);
+  Trace("regexp-brzo-rewrite-debug") << "Result from consuming from left " << result <<std::endl;
+  // Consume from right
+  result = brzo_consume_string(str_vec, result, true, smallest_result_inside);
+  Trace("regexp-brzo-rewrite-debug") << "Result from consuming from right " << result <<std::endl;
+  Trace("regexp-brzo-rewrite-debug")  << pop;
+  if (result == Node::null()) return Node::null();
+
+  Node ret;
+  if (str_vec.size() == 0 ) {
+    Trace("regexp-brzo-rewrite-debug") << "Fully consumed the string " << str << std::endl;
+    auto has_epsilon =  check_epsilon_in_re(result);
+    Node d_emptyWord = Word::mkEmptyWord(nm->stringType());
+    if (has_epsilon == Node::null()) {
+      // We couldn't decide if epsilon is in the reduced string.
+      ret = nm->mkNode(Kind::STRING_IN_REGEXP, d_emptyWord, result);
+    }
+    else {
+      return has_epsilon;
+    }
+  }
+  else {
+    // create the string back
+    Node rem_str = utils::mkConcat(str_vec, nm->stringType());
+    ret = nm->mkNode(Kind::STRING_IN_REGEXP, rem_str, result);
+    Trace("regexp-brzo-rewrite-debug") << "Brzo_consume_left_right ret before simp: " << ret << std::endl;
+  }
+  if (return_smallest) {
+      Trace("regexp-brzo-rewrite-debug") << "Brzo_consume_left_right smallest return: " << smallest_result_inside << std::endl;
+    return smallest_result_inside;
+  }
+
+  return ret;
+}
+
+bool RegExpEntail::brzo_eval_str_in_re(const Node& str, const Node& regex) {
+  Trace("regexp-brzo-rewrite-debug") << "Brzo-eval-str-in-re on string " << str << " and regex " << regex << std::endl;
+  NodeManager* nm = NodeManager::currentNM();
+  auto str_vec = string_flatten_deep(str);
+  Node _ignore;
+  Node result = brzo_consume_string(str_vec, regex, false, _ignore);
+
+  if (result == Node::null() || str_vec.size() != 0) {
+    Trace("regexp-brzo-rewrite-debug") << "Could not evaluate memebership via brzo_eval_str_in_re" << std::endl;
+    Unreachable();
+  }
+  Node has_epsilon = check_epsilon_in_re(result);
+  if (has_epsilon == nm->mkConst(true)) return true;
+  else if (has_epsilon == nm->mkConst(false)) return false;
+  else Unreachable();
+}
+
+/**** End AWS Updates ****/
 
 Node RegExpEntail::simpleRegexpConsume(std::vector<Node>& mchildren,
                                        std::vector<Node>& children,
@@ -424,23 +1245,18 @@ bool RegExpEntail::isConstRegExp(TNode t)
   return true;
 }
 
+/**** AWS update: use Brzo functions ****/
 bool RegExpEntail::testConstStringInRegExp(String& s, TNode r)
 {
-  Kind k = r.getKind();
-  if (k == Kind::REGEXP_CONCAT || k == Kind::REGEXP_STAR
-      || k == Kind::REGEXP_UNION)
-  {
-    // If we can evaluate it via NFA construction, do so. We only do this
-    // for compound regular expressions (re.++, re.*, re.union) which may
-    // have non-trivial NFA constructions, otherwise the check below will
-    // be simpler.
-    if (RegExpEval::canEvaluate(r))
-    {
-      return RegExpEval::evaluate(s, r);
-    }
-  }
-  return testConstStringInRegExpInternal(s, 0, r);
+  // Let us check the membership with Brzo function
+  NodeManager* nm = NodeManager::currentNM();
+  Node str = nm->mkConst(s);
+  Trace("regexp-brzo-rewrite-debug") << "Checking membership for str " << s << " in regex " << r << std::endl;
+  bool result = brzo_eval_str_in_re(str, r);
+  Trace("regexp-brzo-rewrite-debug") << "Result of membership check with Brzo " << result << std::endl;
+  return result;
 }
+/**** End AWS update ****/
 
 bool RegExpEntail::testConstStringInRegExpInternal(String& s,
                                                    unsigned index_start,
